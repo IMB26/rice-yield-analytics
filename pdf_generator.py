@@ -161,9 +161,6 @@ def add_executive_summary(pdf, section):
     )
     pdf.multi_cell(0, 7, narrative)
 
-    # Sources
-    if isinstance(section, dict) and section.get("institutional"):
-        add_sources_section(pdf, section["institutional"])
 # ─────────────────────────────────────────────
 # CHART SECTION
 # ─────────────────────────────────────────────
@@ -207,47 +204,6 @@ def add_chart_section(pdf, title, png_path, section):
         section["narrative"] if isinstance(section, dict) else section
     )
     pdf.multi_cell(0, 6, narrative)
-
-    # Sources
-    if isinstance(section, dict) and section.get("institutional"):
-        add_sources_section(pdf, section["institutional"])
-
-def add_sources_section(pdf, institutional):
-    """Adds a sources list after each chart section."""
-    pdf.ln(4)
-
-    # Sources header
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_text_color(30, 100, 50)
-    pdf.cell(0, 6, "Sources", align="L")
-    pdf.ln(5)
-
-    # Reset margins to full width before printing sources
-    pdf.set_left_margin(10)
-    pdf.set_right_margin(10)
-
-    for source in institutional:
-        # Organization and title
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(60, 60, 60)
-        pdf.multi_cell(
-            0, 5,
-            sanitize_text(f"{source['org']} - {source['title']}")
-        )
-        # URL — smaller font, blue, full width
-        pdf.set_font("Helvetica", "I", 7)
-        pdf.set_text_color(0, 0, 180)
-
-        # Truncate URL if extremely long
-        url = source['url']
-        if len(url) > 80:
-            url = url[:77] + "..."
-
-        pdf.cell(0, 5, url, align="L")
-        pdf.ln(6)
-
-    # Reset text color
-    pdf.set_text_color(60, 60, 60)
 
 
 # ─────────────────────────────────────────────
@@ -298,9 +254,79 @@ def add_text_section(pdf, title, section):
     )
     pdf.multi_cell(0, 6, narrative)
 
-    # Sources
-    if isinstance(section, dict) and section.get("institutional"):
-        add_sources_section(pdf, section["institutional"])
+
+# ─────────────────────────────────────────────
+# CONSOLIDATED REFERENCES PAGE
+# ─────────────────────────────────────────────
+
+_SECTION_LABELS = [
+    ("executive_summary", "Executive Summary"),
+    ("yield_trend",       "National Yield Trend"),
+    ("ecosystem",         "Ecosystem Comparison"),
+    ("seasonal",          "Seasonal Analysis"),
+    ("area_vs_yield",     "Area Harvested vs Yield"),
+    ("top_provinces",     "Top & Bottom Provinces"),
+    ("regional",          "Regional Yield Analysis"),
+    ("3d_surface",        "3D Yield Surface"),
+]
+
+
+def add_references_page(pdf, insights):
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(30, 100, 50)
+    pdf.cell(0, 10, "References", align="L")
+    pdf.ln(8)
+
+    pdf.set_draw_color(30, 100, 50)
+    pdf.set_line_width(0.5)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(8)
+
+    any_printed = False
+
+    for key, label in _SECTION_LABELS:
+        section  = insights.get(key, {})
+        articles = section.get("articles", []) if isinstance(section, dict) else []
+        if not articles:
+            continue
+
+        any_printed = True
+
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(30, 100, 50)
+        pdf.cell(0, 7, label, align="L")
+        pdf.ln(7)
+
+        pdf.set_left_margin(10)
+        pdf.set_right_margin(10)
+
+        for article in articles:
+            title  = sanitize_text(article.get("title", "Untitled"))
+            source = article.get("source", "")
+            url    = article.get("url", "")
+
+            label_text = f"{title} ({source})" if source else title
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(60, 60, 60)
+            pdf.multi_cell(0, 5, sanitize_text(label_text))
+
+            if url:
+                pdf.set_font("Helvetica", "I", 7)
+                pdf.set_text_color(0, 0, 180)
+                if len(url) > 90:
+                    url = url[:87] + "..."
+                pdf.cell(0, 5, url, align="L")
+                pdf.ln(5)
+
+        pdf.set_text_color(60, 60, 60)
+        pdf.ln(4)
+
+    if not any_printed:
+        pdf.set_font("Helvetica", "I", 10)
+        pdf.set_text_color(130, 130, 130)
+        pdf.cell(0, 7, "No external Tavily sources were retrieved for this report.", align="L")
 
 
 def generate_report(figures, insights, stats):
@@ -327,20 +353,18 @@ def generate_report(figures, insights, stats):
 
     # 3. Chart sections
     chart_sections = [
-    (f"National Yield Trend ({stats['year_range']})",        "yield_trend"),
-    ("Ecosystem Comparison: Irrigated vs Rainfed",           "ecosystem"),
-    ("Wet Season vs Dry Season Analysis",                    "seasonal"),
-    ("Area Harvested vs Yield",                              "area_vs_yield"),
-    ("Top & Bottom Provinces by Yield",                      "top_provinces"),
+        (f"National Yield Trend ({stats['year_range']})", "yield_trend"),
+        ("Ecosystem Comparison: Irrigated vs Rainfed",    "ecosystem"),
+        ("Wet Season vs Dry Season Analysis",             "seasonal"),
+        ("Area Harvested vs Yield",                       "area_vs_yield"),
+        ("Top & Bottom Provinces by Yield",               "top_provinces"),
     ]
 
-
-    
     for title, key in chart_sections:
         png_path = fig_to_png(figures[key], f"{key}.png")
         add_chart_section(pdf, title, png_path, insights[key])
-    
-        # Text-only sections for interactive charts
+
+    # Text-only sections for interactive charts
     text_only_sections = [
         ("Regional Yield Analysis",              "regional"),
         ("3D Yield Surface - Regional Overview", "3d_surface"),
@@ -349,5 +373,7 @@ def generate_report(figures, insights, stats):
     for title, key in text_only_sections:
         add_text_section(pdf, title, insights[key])
 
-    # Return as bytes for Streamlit download button
+    # 5. Consolidated references page
+    add_references_page(pdf, insights)
+
     return bytes(pdf.output())

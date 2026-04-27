@@ -30,7 +30,7 @@ REGION_NAME_MAP = {
     "REGION XIII (CARAGA)":                                   "Region XIII",
 }
 
-#Load and Validate
+# Load and Validate
 def load_and_validate(file, column_mapping=None):
     """
     Reads CSV and checks all required columns exist.

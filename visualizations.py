@@ -2,6 +2,51 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+# ─────────────────────────────────────────────
+# SHARED CHART THEME
+# ─────────────────────────────────────────────
+_FONT = "Inter, -apple-system, Arial, sans-serif"
+
+_LAYOUT = dict(
+    font=dict(family=_FONT, size=12, color="#c9d1d9"),
+    title_font=dict(family=_FONT, size=14, color="#2ecc71"),
+    plot_bgcolor="#161b27",
+    paper_bgcolor="#0d1117",
+    margin=dict(l=20, r=20, t=55, b=20),
+    legend=dict(
+        bgcolor="rgba(22,27,39,0.9)",
+        bordercolor="#2a3347",
+        borderwidth=1,
+        font=dict(size=11, color="#c9d1d9"),
+    ),
+    hoverlabel=dict(
+        bgcolor="#1c2535",
+        bordercolor="#27ae60",
+        font_size=12,
+        font_family=_FONT,
+        font_color="#e2e8f0",
+    ),
+)
+
+_AXIS = dict(
+    gridcolor="#21293d",
+    showgrid=True,
+    zeroline=False,
+    linecolor="#2a3347",
+    showline=True,
+    ticks="outside",
+    tickcolor="#2a3347",
+    tickfont=dict(color="#8892a4"),
+)
+
+
+def _theme(fig, is_3d=False):
+    fig.update_layout(**_LAYOUT)
+    if not is_3d:
+        fig.update_xaxes(**_AXIS)
+        fig.update_yaxes(**_AXIS)
+    return fig
+
 
 def is_chart_empty(fig):
     """
@@ -58,8 +103,8 @@ def plot_yield_trend(df):
         eco_filter = df["ecosystem"].iloc[0]
 
     filtered = df[
-    (df["level"] == level_filter) &
-    (df["ecosystem"] == eco_filter)
+        (df["level"] == level_filter) &
+        (df["ecosystem"] == eco_filter)
     ]
 
     # Use weighted average when at province level
@@ -127,12 +172,10 @@ def plot_yield_trend(df):
         title=f"Rice Yield Trend — {label} ({filtered['year'].min()}-{filtered['year'].max()})",
         xaxis_title="Year",
         yaxis_title="Yield (MT/ha)",
-        plot_bgcolor="white",
         hovermode="x unified",
         showlegend=False
     )
-
-    return fig
+    return _theme(fig)
 # ─────────────────────────────────────────────
 # 2. ECOSYSTEM COMPARISON
 # ─────────────────────────────────────────────
@@ -158,9 +201,6 @@ def plot_ecosystem_comparison(df):
         label = "Region Level"
     else:
         label = "All Levels"
-
-    # Check if both ecosystems still exist after filtering
-    available_ecosystems = filtered["ecosystem"].unique().tolist()
 
     if filtered.empty:
         # Return empty figure with message
@@ -196,12 +236,9 @@ def plot_ecosystem_comparison(df):
         points="outliers"
     )
 
-    fig.update_layout(
-        plot_bgcolor="white",
-        showlegend=False
-    )
+    fig.update_layout(showlegend=False)
+    return _theme(fig)
 
-    return fig
 # ─────────────────────────────────────────────
 # 3. WET VS DRY SEASON ANALYSIS
 # ─────────────────────────────────────────────
@@ -290,12 +327,9 @@ def plot_seasonal_analysis(df):
         }
     )
 
-    fig.update_layout(
-        plot_bgcolor="white",
-        hovermode="x unified"
-    )
+    fig.update_layout(hovermode="x unified")
+    return _theme(fig)
 
-    return fig
 # ─────────────────────────────────────────────
 # 4. REGIONAL YIELD HEATMAP
 # ─────────────────────────────────────────────
@@ -368,12 +402,8 @@ def plot_regional_heatmap(df):
         )
     )
 
-    fig.update_layout(
-        plot_bgcolor="white",
-        xaxis_nticks=20
-    )
-
-    return fig
+    fig.update_layout(xaxis_nticks=20)
+    return _theme(fig)
 # ─────────────────────────────────────────────
 # 5. AREA HARVESTED VS YIELD
 # ─────────────────────────────────────────────
@@ -444,12 +474,8 @@ def plot_area_vs_yield(df):
 
     fig.update_traces(marker=dict(size=5))
 
-    fig.update_layout(
-        plot_bgcolor="white",
-        hovermode="closest"
-    )
-
-    return fig
+    fig.update_layout(hovermode="closest")
+    return _theme(fig)
 # ─────────────────────────────────────────────
 # 6. TOP 10 PROVINCES RANKING
 # ─────────────────────────────────────────────
@@ -562,14 +588,12 @@ def plot_top_provinces(df):
     fig.update_traces(textposition="outside")
 
     fig.update_layout(
-        plot_bgcolor="white",
         xaxis_title="Average Yield (MT/ha)",
         yaxis_title="Province",
         legend_title="Ranking",
         height=600
     )
-
-    return fig
+    return _theme(fig)
 
 # ─────────────────────────────────────────────
 # 7. 3D SURFACE PLOT — REGION × YEAR × YIELD
@@ -654,12 +678,9 @@ def plot_3d_yield_surface(df):
             xaxis=dict(title="Year"),
             yaxis=dict(title="Region"),
             zaxis=dict(title="Yield (MT/ha)"),
-            camera=dict(
-                eye=dict(x=1.8, y=-1.8, z=0.8)
-            )
+            camera=dict(eye=dict(x=1.8, y=-1.8, z=0.8))
         ),
         height=650,
         margin=dict(l=0, r=0, t=50, b=0)
     )
-
-    return fig
+    return _theme(fig, is_3d=True)

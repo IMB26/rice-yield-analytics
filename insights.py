@@ -1,578 +1,501 @@
 import os
+import json
+import re
 from groq import Groq
+from tavily import TavilyClient
 from dotenv import load_dotenv
+from data_processor import REQUIRED_COLUMNS
 
-load_dotenv()
+load_dotenv(override=True)
 
-# ─────────────────────────────────────────────
-# SETUP
-# ─────────────────────────────────────────────
+# -----------------------------
+# API clients
+# -----------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-client = Groq(api_key=os.getenv("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"))
-MODEL  = "llama-3.3-70b-versatile"
+MODEL = "llama-3.3-70b-versatile"
+
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
+
+
+# -----------------------------
+# Static search seeds per chart
+# -----------------------------
+SEARCH_QUERIES = {
+    "yield_trend": [
+        "Philippine rice yield production trend PSA",
+        "RCEF rice competitiveness enhancement fund Philippines",
+        "PAGASA climate impacts rice Philippines",
+    ],
+    "ecosystem": [
+        "irrigated vs rainfed rice yield Philippines",
+        "NIA irrigation infrastructure Philippines rice",
+        "IRRI rainfed rice vulnerability Philippines",
+    ],
+    "seasonal": [
+        "wet dry season rice yield Philippines",
+        "PAGASA El Nino La Nina Philippines agriculture",
+        "PhilRice seasonal rice management",
+    ],
+    "regional": [
+        "regional rice production Philippines PSA",
+        "Central Luzon rice productivity factors",
+        "BARMM rice production constraints",
+    ],
+    "area_vs_yield": [
+        "farm size rice productivity Philippines",
+        "CARP land reform farm fragmentation Philippines",
+        "IRRI mechanization smallholder rice",
+    ],
+    "top_provinces": [
+        "top rice producing provinces Philippines PSA",
+        "Nueva Ecija irrigation rice yield",
+        "low productivity rice provinces Philippines",
+    ],
+    "3d_surface": [
+        "regional rice yield disparity Philippines",
+        "Philippine rice productivity by region",
+        "DA regional rice programs Philippines",
+    ],
+    "executive_summary": [
+        "Philippine rice industry overview 2024",
+        "rice self sufficiency Philippines DA",
+        "Philippines rice climate resilience programs",
+    ],
+}
+
+ALLOWED_DOMAINS = [
+    "psa.gov.ph",
+    "da.gov.ph",
+    "irri.org",
+    "philrice.gov.ph",
+    "pagasa.dost.gov.ph",
+    "nia.gov.ph",
+    "fao.org",
+    "reliefweb.int",
+    "rappler.com",
+    "inquirer.net",
+    "businessmirror.com.ph",
+]
+
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def _extract_balanced_json_object(text: str):
+    """
+    Extract the first balanced JSON object from text.
+    Handles braces inside quoted strings.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    in_string = False
+    escaped = False
+    depth = 0
+
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+
+    return None
+
+
+def _safe_json_loads(raw: str, default):
+    if not raw:
+        return default
+    raw = raw.strip()
+
+    candidates = [raw]
+
+    # Candidate: markdown fenced JSON
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        candidates.append(fence_match.group(1).strip())
+
+    # Candidate: first balanced JSON object anywhere in text
+    balanced = _extract_balanced_json_object(raw)
+    if balanced:
+        candidates.append(balanced.strip())
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+
+    return default
 
 
 def build_filter_context(stats, filters):
-    """
-    Builds a human readable filter context string
-    that gets injected into every AI prompt.
-    """
-    lines = [
-        f"- Year range: {filters.get('year_range', stats['year_range'])}",
+    return "\n".join([
+        f"- Year range: {filters.get('year_range', stats.get('year_range', 'N/A'))}",
         f"- Ecosystem: {', '.join(filters.get('ecosystems', ['All ecosystems']))}",
         f"- Season: {', '.join(filters.get('semesters', ['All seasons']))}",
-    ]
-    return "\n".join(lines)
-# ─────────────────────────────────────────────
-# CORE FUNCTION — ASK GROQ
-# ─────────────────────────────────────────────
+    ])
 
-def ask_groq(prompt, filter_context=""):
-    """
-    Sends a prompt to Groq and returns the response text.
-    Injects filter context into system prompt if provided.
-    """
-    system_content = (
-        "You are a senior agricultural data analyst and researcher "
-        "specializing in Philippine rice production with deep knowledge "
-        "of Philippine agricultural history, climate patterns, and policy. "
-        "\n\n"
-        "When analyzing data you must: \n"
-        "1. Explain not just WHAT happened but WHY it happened\n"
-        "2. Identify specific possible factors — climate events, "
-        "policy changes, infrastructure, technology adoption\n"
-        "3. Reference real events where relevant — typhoons, "
-        "El Niño/La Niña episodes, government programs\n"
-        "4. Cite only these verified sources when referencing "
-        "external information: PSA (Philippine Statistics Authority), "
-        "PhilRice (Philippine Rice Research Institute), "
-        "IRRI (International Rice Research Institute), "
-        "PAGASA (Philippine weather agency), "
-        "DA (Department of Agriculture), "
-        "FAO (Food and Agriculture Organization)\n"
-        "5. Write in 4-6 sentences in a professional but accessible tone\n"
-        "6. Never use bullet points — always write in paragraph form\n"
-        "7. Always refer to yield in MT/ha units\n"
-        "8. Always acknowledge the active filters at the start of "
-        "your analysis so the reader knows what data was analyzed"
+
+def _shorten_articles(articles):
+    compact = []
+    for a in articles:
+        compact.append({
+            "title": a.get("title", ""),
+            "url": a.get("url", ""),
+            "source": a.get("source", ""),
+            "snippet": (a.get("snippet", "") or "")[:350],
+        })
+    return compact
+
+
+# -----------------------------
+# Dataset evidence builder
+# -----------------------------
+def build_dataset_evidence(chart_key: str, stats: dict) -> dict:
+    evidence = {
+        "chart_key": chart_key,
+        "scope": {
+            "year_range": stats.get("year_range"),
+            "total_records": stats.get("total_records"),
+            "provinces": stats.get("provinces"),
+            "regions": stats.get("regions"),
+        },
+        "metrics": {},
+        "claims_seed": [],
+    }
+
+    if chart_key == "yield_trend":
+        evidence["metrics"] = {
+            "national_avg_yield_mt_ha": stats.get("national_avg_yield"),
+            "national_max_yield_mt_ha": stats.get("national_max_yield"),
+            "national_min_yield_mt_ha": stats.get("national_min_yield"),
+            "best_year": stats.get("best_year"),
+            "worst_year": stats.get("worst_year"),
+        }
+        evidence["claims_seed"] = [
+            "Describe national trajectory from worst to best year.",
+            "Quantify spread between minimum and maximum yield.",
+            "Mark causes as hypothesis unless externally supported.",
+        ]
+
+    elif chart_key == "ecosystem":
+        evidence["metrics"] = {
+            "irrigated_avg_yield_mt_ha": stats.get("irrigated_avg_yield"),
+            "rainfed_avg_yield_mt_ha": stats.get("rainfed_avg_yield"),
+        }
+        evidence["claims_seed"] = [
+            "Quantify irrigated vs rainfed gap directly from dataset.",
+            "Do not assume reasons without evidence support.",
+        ]
+
+    elif chart_key == "seasonal":
+        evidence["metrics"] = {
+            "wet_season_avg_mt_ha": stats.get("wet_season_avg"),
+            "dry_season_avg_mt_ha": stats.get("dry_season_avg"),
+        }
+        evidence["claims_seed"] = [
+            "Compare wet and dry season averages using given values only.",
+        ]
+
+    elif chart_key in ["regional", "top_provinces", "3d_surface", "area_vs_yield", "executive_summary"]:
+        evidence["metrics"] = {
+            "top_5_provinces": stats.get("top_5_provinces"),
+            "bottom_5_provinces": stats.get("bottom_5_provinces"),
+            "national_avg_yield_mt_ha": stats.get("national_avg_yield"),
+            "best_year": stats.get("best_year"),
+            "worst_year": stats.get("worst_year"),
+            "irrigated_avg_yield_mt_ha": stats.get("irrigated_avg_yield"),
+            "rainfed_avg_yield_mt_ha": stats.get("rainfed_avg_yield"),
+            "wet_season_avg_mt_ha": stats.get("wet_season_avg"),
+            "dry_season_avg_mt_ha": stats.get("dry_season_avg"),
+        }
+        evidence["claims_seed"] = [
+            "State ranking and disparity findings only when directly supported by metrics.",
+            "Separate facts from hypotheses.",
+        ]
+
+    return evidence
+
+
+# -----------------------------
+# Tavily search
+# -----------------------------
+def build_dynamic_queries(chart_key: str, pass1: dict) -> list:
+    queries = list(SEARCH_QUERIES.get(chart_key, []))
+    findings = pass1.get("dataset_findings", [])
+
+    for f in findings:
+        claim = (f.get("claim") or "").strip()
+        if claim:
+            queries.append(f"Philippines rice: {claim}")
+
+    seen = set()
+    deduped = []
+    for q in queries:
+        if q and q not in seen:
+            seen.add(q)
+            deduped.append(q)
+
+    return deduped[:8]
+
+
+def search_real_articles(chart_key: str, override_queries=None) -> list:
+    if tavily is None:
+        return []
+
+    queries = override_queries or SEARCH_QUERIES.get(chart_key, [])
+    articles = []
+
+    for query in queries:
+        try:
+            results = tavily.search(
+                query=query,
+                search_depth="basic",
+                max_results=2,
+                include_domains=ALLOWED_DOMAINS
+            )
+            for r in results.get("results", []):
+                url = r.get("url", "") or ""
+                source = ""
+                try:
+                    source = url.split("/")[2]
+                except Exception:
+                    source = ""
+                articles.append({
+                    "title": r.get("title", ""),
+                    "url": url,
+                    "snippet": (r.get("content", "") or "")[:400],
+                    "source": source,
+                })
+        except Exception:
+            continue
+
+    # Deduplicate by URL
+    seen = set()
+    unique = []
+    for a in articles:
+        url = a.get("url", "")
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(a)
+
+    # Show two more sources than before (8 -> 10)
+    return unique[:10]
+
+
+# -----------------------------
+# Two-pass generation
+# -----------------------------
+CHART_GUIDANCE = {
+    "yield_trend": "Focus on long-run trend, best/worst year contrast, and plausible drivers as hypotheses.",
+    "ecosystem": "Focus on irrigated vs rainfed yield difference and implications for resilience.",
+    "seasonal": "Focus on wet vs dry comparison and seasonal risk framing.",
+    "regional": "Focus on regional disparity and potential structural explanations.",
+    "area_vs_yield": "Focus on farm area versus productivity relationship and caveats.",
+    "top_provinces": "Focus on top/bottom ranking and practical implications.",
+    "3d_surface": "Focus on landscape interpretation and inequality over time.",
+    "executive_summary": "Integrate top findings into concise policy-oriented summary.",
+}
+
+
+def generate_dataset_first_analysis(chart_key: str, evidence: dict, filter_context: str) -> dict:
+    if client is None:
+        return {
+            "dataset_findings": [],
+            "draft_narrative": "Insight unavailable: GROQ_API_KEY is not configured.",
+        }
+
+    system_msg = (
+        "You are a senior agricultural data analyst.\n"
+        "Rules:\n"
+        "1) Use ONLY the provided dataset evidence.\n"
+        "2) Do NOT use external facts in this step.\n"
+        "3) If a cause is uncertain, label it as hypothesis.\n"
+        "4) Return valid JSON only."
     )
 
-    if filter_context:
-        system_content += f"\n\nActive filters applied to this analysis:\n{filter_context}"
+    user_msg = f"""
+Chart key: {chart_key}
+Chart guidance: {CHART_GUIDANCE.get(chart_key, "General agricultural analysis.")}
+
+Active filters:
+{filter_context}
+
+Dataset evidence JSON:
+{json.dumps(evidence, ensure_ascii=True)}
+
+Return exactly this JSON schema:
+{{
+  "dataset_findings": [
+    {{
+      "id": "F1",
+      "claim": "text",
+      "evidence": "explicit metric/value from dataset evidence",
+      "type": "fact|hypothesis",
+      "confidence": 0.0
+    }}
+  ],
+  "draft_narrative": "6-8 sentences, paragraph only, no bullets, MT/ha units where relevant"
+}}
+"""
 
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": system_content
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
         )
-        return response.choices[0].message.content
+        raw = resp.choices[0].message.content
+        parsed = _safe_json_loads(raw, default=None)
+        if parsed and isinstance(parsed, dict):
+            # Normalize required keys to avoid downstream key errors
+            parsed.setdefault("dataset_findings", [])
+            parsed.setdefault("draft_narrative", "")
+            if not isinstance(parsed["dataset_findings"], list):
+                parsed["dataset_findings"] = []
+            if not isinstance(parsed["draft_narrative"], str):
+                parsed["draft_narrative"] = str(parsed["draft_narrative"])
+            return parsed
+        return {
+            "dataset_findings": [],
+            "draft_narrative": (
+                "Insight unavailable: dataset-first JSON parse failed. "
+                f"Raw preview: {(raw or '')[:300]}"
+            ),
+        }
     except Exception as e:
-        return f"Insight unavailable: {e}"
-    
-# ─────────────────────────────────────────────
-# 1. YIELD TREND — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_yield_trend(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a full analytical report section on national rice
-    yield trends in the Philippines from {stats['year_range']}.
-
-    Data:
-    - Period average yield: {stats['national_avg_yield']} MT/ha
-    - Peak yield: {stats['national_max_yield']} MT/ha
-      in {stats['best_year']}
-    - Lowest yield: {stats['national_min_yield']} MT/ha
-      in {stats['worst_year']}
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — Overall trend:
-    Describe the upward trajectory from {stats['worst_year']}
-    to {stats['best_year']}. Quantify the improvement percentage.
-    Explain the key drivers — adoption of high yielding varieties
-    developed by PhilRice and IRRI, expansion of irrigation
-    infrastructure by NIA, and government programs like the
-    Rice Competitiveness Enhancement Fund (RCEF).
-
-    Paragraph 2 — The 2009 dip:
-    Explain Typhoon Ondoy in detail — date of landfall
-    September 26 2009, areas flooded, timing during grain
-    filling stage, estimated agricultural damage, and why
-    Central Luzon was most affected. Explain why dry season
-    2010 was also suppressed due to damaged irrigation
-    infrastructure and lost farmer capital.
-
-    Paragraph 3 — Peak performance {stats['best_year']}:
-    Explain what contributed to the peak year — favorable
-    climate conditions, widespread adoption of improved seed
-    varieties, expanded irrigation coverage, and the impact
-    of DA agricultural support programs.
-
-    Paragraph 4 — Policy implications:
-    What does this trend mean for Philippine food security,
-    rice import dependency, and future agricultural investment
-    priorities? Reference the Rice Tariffication Law of 2019
-    and its implications.
-
-    Cite PSA, DA, PAGASA, PhilRice, IRRI where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 2. ECOSYSTEM — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_ecosystem(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    irrigated = stats['irrigated_avg_yield']
-    rainfed   = stats['rainfed_avg_yield']
-
-    if irrigated != "N/A" and rainfed != "N/A":
-        gap = round(irrigated - rainfed, 2)
-        gap_line = f"Yield gap: {gap} MT/ha ({round((gap/rainfed)*100, 1)}% advantage)"
-    elif irrigated == "N/A":
-        gap_line = "Irrigated Palay data not available in current filters"
-    elif rainfed == "N/A":
-        gap_line = "Rainfed Palay data not available in current filters"
-    else:
-        gap_line = "Both ecosystem types unavailable in current filters"
-
-    prompt = f"""
-    Write a full analytical report section on the yield
-    difference between irrigated and rainfed rice farming
-    in the Philippines from {stats['year_range']}.
-
-    Data:
-    - Irrigated Palay average yield: {irrigated} MT/ha
-    - Rainfed Palay average yield: {rainfed} MT/ha
-    - {gap_line}
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — The yield gap:
-    Quantify and contextualize the gap between irrigated
-    and rainfed systems. Explain why this gap exists —
-    water control enabling precise nutrient management,
-    ability to plant multiple cropping cycles per year,
-    and reduced climate risk exposure.
-
-    Paragraph 2 — Geographic vulnerability:
-    Identify which Philippine regions are most dependent
-    on rainfed farming — Visayas, parts of Mindanao,
-    upland areas. Discuss how this dependence creates
-    food security vulnerability during drought years
-    and El Niño episodes.
-
-    Paragraph 3 — Infrastructure investment:
-    Discuss the role of NIA irrigation systems in driving
-    irrigated farm productivity. Explain why Central Luzon
-    leads — it has the most developed irrigation network.
-    Cite specific NIA coverage statistics where possible.
-
-    Paragraph 4 — Policy recommendations:
-    What investments would most effectively close the gap?
-    Discuss small scale irrigation, AWD (Alternate Wetting
-    and Drying) technology from IRRI, and DA support programs
-    for rainfed farmers.
-
-    Cite IRRI, PhilRice, NIA, DA where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 3. SEASONAL — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_seasonal(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a full analytical report section on wet season
-    vs dry season rice yield patterns in the Philippines
-    from {stats['year_range']}.
-
-    Data:
-    - Wet season average: {stats['wet_season_avg']} MT/ha
-    - Dry season average: {stats['dry_season_avg']} MT/ha
-    - Note: N/A means that season was excluded by filters
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — Seasonal patterns overview:
-    Describe the surprisingly close performance between
-    wet and dry seasons. Explain the Philippine rice
-    calendar — wet season June to November, dry season
-    December to May. Discuss why dry season slightly
-    outperforms despite no rainfall.
-
-    Paragraph 2 — Role of irrigation in dry season:
-    Explain how irrigation infrastructure compensates
-    for absent rainfall in dry season. Discuss why
-    irrigated provinces maintain high yields year round
-    while rainfed provinces show dramatic seasonal drops.
-
-    Paragraph 3 — Climate variability impacts:
-    Explain how El Niño suppresses wet season yields
-    through drought during flowering stage, while
-    La Niña causes flooding damage during harvest.
-    Reference specific PAGASA documented episodes
-    — 2010 La Niña, 2016 El Niño.
-
-    Paragraph 4 — Seasonal risk management:
-    What strategies do farmers and DA use to manage
-    seasonal risk? Discuss crop insurance, early warning
-    systems from PAGASA, and stress tolerant varieties
-    from PhilRice.
-
-    Cite PAGASA, IRRI, PhilRice, DA where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 4. REGIONAL — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_regional(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a full analytical report section on regional
-    rice yield performance across the Philippines
-    from {stats['year_range']}.
-
-    Data:
-    - Regions analyzed: {stats['regions']}
-    - Top 5 provinces: {stats['top_5_provinces']}
-    - Bottom 5 provinces: {stats['bottom_5_provinces']}
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — Central Luzon dominance:
-    Explain specifically why Central Luzon consistently
-    leads — NIA irrigation systems covering the Pampanga
-    River basin, flat fertile plains ideal for mechanized
-    farming, proximity to Manila markets, strong agricultural
-    extension services, and concentration of PhilRice
-    research stations.
-
-    Paragraph 2 — High performing regions:
-    Discuss Cagayan Valley and Ilocos Region as strong
-    performers. Explain their geographic and infrastructural
-    advantages — river systems, irrigation coverage,
-    farming culture.
-
-    Paragraph 3 — Underperforming regions:
-    Explain the persistently low yields in BARMM —
-    conflict history limiting infrastructure investment,
-    geographic isolation of island provinces like
-    Sulu and Tawi-Tawi, limited irrigation coverage,
-    and fragmented landholdings. Discuss the Davao
-    Occidental anomaly as a data artifact from
-    its recent creation as a province in 2013.
-
-    Paragraph 4 — Closing the regional gap:
-    What targeted investments would most effectively
-    improve yields in underperforming regions?
-    Discuss DA regional programs, peace and development
-    initiatives in BARMM, and island connectivity.
-
-    Cite PSA, DA, NIA, IRRI where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 5. AREA VS YIELD — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_area_vs_yield(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a full analytical report section on the
-    relationship between farm area harvested and rice
-    yield in the Philippines from {stats['year_range']}.
-
-    Data:
-    - Most provinces: 0 to 20,000 hectares
-    - Irrigated average yield: {stats['irrigated_avg_yield']} MT/ha
-    - Rainfed average yield: {stats['rainfed_avg_yield']} MT/ha
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — Farm size distribution:
-    Describe the clustering of Philippine rice farms
-    in the 0 to 20,000 hectare range. Explain the
-    historical context — land reform programs, the
-    Comprehensive Agrarian Reform Program (CARP),
-    and how landholding fragmentation came to define
-    Philippine rice agriculture.
-
-    Paragraph 2 — Scale vs productivity:
-    Explain why farm size does not strongly predict yield.
-    Discuss how small irrigated farms in Nueva Ecija
-    consistently outperform large rainfed farms elsewhere.
-    The key determinant is water access and input quality,
-    not scale.
-
-    Paragraph 3 — Mechanization challenges:
-    Discuss how fragmented smallholder farms limit
-    mechanization adoption. Explain DA's farm consolidation
-    and mechanization programs and their challenges.
-    Reference IRRI research on optimal farm size for
-    mechanized rice production.
-
-    Paragraph 4 — Future of farm structure:
-    Discuss the tension between land reform social goals
-    and agricultural productivity goals. What models —
-    cooperative farming, contract growing, farm clusters —
-    could improve productivity while respecting land rights?
-
-    Cite IRRI, DA, PSA Census of Agriculture where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 6. TOP PROVINCES — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_top_provinces(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a full analytical report section on top and
-    bottom performing provinces for rice yield in the
-    Philippines from {stats['year_range']}.
-
-    Data:
-    - Top 5 provinces: {stats['top_5_provinces']}
-    - Bottom 5 provinces: {stats['bottom_5_provinces']}
-    - Total provinces: {stats['provinces']}
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — Top performers:
-    Analyze what makes the top provinces excel. Focus on
-    Nueva Ecija as the undisputed leader — explain its
-    NIA irrigation coverage, soil quality in the Cagayan
-    and Pampanga river basins, strong farming cooperatives,
-    and proximity to PhilRice research stations. Discuss
-    other top performers and their specific advantages.
-
-    Paragraph 2 — Bottom performers:
-    Analyze the bottom provinces with nuance. Distinguish
-    between genuinely low productivity provinces —
-    Sulu, Tawi-Tawi due to conflict and isolation —
-    and data artifacts like Davao Occidental which was
-    only created as a province in 2013 giving it fewer
-    data years and artificially low averages.
-
-    Paragraph 3 — The productivity gap:
-    Quantify the gap between top and bottom performers.
-    Discuss whether this gap has widened or narrowed
-    over the 20 year period. Explain what structural
-    factors make it persistent — geography, peace and
-    order, infrastructure investment history.
-
-    Paragraph 4 — Targeted interventions:
-    What specific investments would most help bottom
-    performing provinces? Discuss small scale irrigation,
-    seed subsidy programs, agricultural extension services,
-    and peace and development programs for conflict
-    affected areas.
-
-    Cite PSA provincial data, DA, NIA where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 7. 3D SURFACE — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_3d_surface(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a full analytical report section on the 3D
-    rice yield surface showing regional performance
-    across the Philippines from {stats['year_range']}.
-
-    Data:
-    - Regions analyzed: {stats['regions']}
-    - Peak yield: {stats['national_max_yield']} MT/ha
-      in {stats['best_year']}
-    - Top 5 provinces: {stats['top_5_provinces']}
-    - Bottom 5 provinces: {stats['bottom_5_provinces']}
-
-    Write exactly 4 detailed paragraphs:
-
-    Paragraph 1 — The yield landscape:
-    Describe the overall shape of the Philippine rice
-    yield landscape as seen in the 3D surface. Identify
-    the prominent peaks — Central Luzon ridge — and
-    the persistent valleys — BARMM, island provinces.
-    Explain what this landscape reveals about agricultural
-    inequality that flat charts cannot show.
-
-    Paragraph 2 — Temporal dimension:
-    Describe the upward slope from left to right —
-    the overall improvement from 2000 to 2019.
-    Identify the 2009 valley visible across most regions
-    from Typhoon Ondoy. Discuss how the slope steepness
-    varies by region — some regions improved rapidly
-    while others stagnated.
-
-    Paragraph 3 — Regional divergence:
-    Discuss whether regions are converging or diverging
-    in yield performance over time. Are top regions
-    pulling further ahead or are lagging regions
-    catching up? What does this mean for regional
-    inequality in Philippine agriculture?
-
-    Paragraph 4 — Policy implications:
-    What does the 3D yield landscape tell policymakers
-    about where to prioritize investment? Discuss
-    targeted regional programs, infrastructure gaps,
-    and the potential for yield improvement in
-    currently underperforming regions.
-
-    Cite PSA, DA, IRRI where relevant.
-    Write in formal analytical tone suitable for a government report.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-
-
-# ─────────────────────────────────────────────
-# 8. EXECUTIVE SUMMARY — FULL REPORT
-# ─────────────────────────────────────────────
-
-def insight_executive_summary(stats, filters={}):
-    filter_context = build_filter_context(stats, filters)
-    prompt = f"""
-    Write a professional executive summary of Philippine
-    rice production performance from {stats['year_range']}.
-
-    Data:
-    - {stats['provinces']} provinces, {stats['regions']} regions
-    - National average yield: {stats['national_avg_yield']} MT/ha
-    - Yield range: {stats['national_min_yield']} to
-      {stats['national_max_yield']} MT/ha
-    - Best year: {stats['best_year']}
-    - Worst year: {stats['worst_year']}
-    - Irrigated vs Rainfed: {stats['irrigated_avg_yield']}
-      vs {stats['rainfed_avg_yield']} MT/ha
-    - Top province: Nueva Ecija at
-      {list(stats['top_5_provinces'].values())[0]
-        if stats['top_5_provinces'] else 'N/A'} MT/ha
-
-    Write exactly 5 detailed paragraphs:
-
-    Paragraph 1 — Filter context and scope:
-    Clearly state what data was analyzed — year range,
-    ecosystems, seasons, and geographic levels included.
-    State the total records and coverage.
-
-    Paragraph 2 — Overall performance:
-    Summarize the national yield trajectory. Quantify
-    improvement. Identify best and worst years with causes.
-    Reference the Rice Tariffication Law and RCEF program.
-
-    Paragraph 3 — Key disparities:
-    Summarize the two most important gaps found —
-    irrigated vs rainfed yield gap and regional disparity
-    between Central Luzon and underperforming regions.
-
-    Paragraph 4 — Climate vulnerability:
-    Discuss the 2009 Typhoon Ondoy impact and what it
-    reveals about climate vulnerability. Reference
-    El Niño and La Niña effects on seasonal yields.
-
-    Paragraph 5 — Recommendations:
-    Provide 3 specific forward looking recommendations
-    for improving Philippine rice production — irrigation
-    expansion, targeted provincial programs, and
-    climate resilient variety adoption.
-
-    Write in formal executive tone suitable for senior
-    government officials. Cite PSA, DA, IRRI, PhilRice,
-    FAO where relevant.
-    Never use bullet points — full paragraphs only.
-    """
-    return ask_groq(prompt, filter_context)
-# ─────────────────────────────────────────────
-# COLUMN MAPPING
-# ─────────────────────────────────────────────
-
-REQUIRED_COLUMNS = [
-    "Ecosystem/Croptype",
-    "Geolocation",
-    "Year",
-    "Semester",
-    "Level",
-    "AreaHarvested",
-    "Production",
-    "Yield"
-]
-
-def map_columns(uploaded_columns: list) -> dict:
-    """
-    Sends uploaded CSV column names to Groq and asks it
-    to map them to the required column names.
-    Returns a dictionary mapping uploaded → required.
-    """
-    prompt = f"""
-    I have a CSV file with these columns:
-    {uploaded_columns}
-
-    I need to map them to these required columns:
-    {REQUIRED_COLUMNS}
-
-    Rules:
-    - Match based on meaning, not exact spelling
-    - Every required column must be mapped to exactly
-      one uploaded column
-    - If a required column has no reasonable match,
-      map it to null
-    - Return ONLY a valid JSON object
-    - No explanation, no markdown, no backticks
-    - Format: {{"uploaded_column": "Required_Column"}}
-
-    Example output:
+        return {
+            "dataset_findings": [],
+            "draft_narrative": f"Insight unavailable: dataset-first request failed ({e}).",
+        }
+
+
+def ground_with_tavily_sources(chart_key: str, pass1: dict, articles: list) -> dict:
+    if client is None:
+        return {
+            "supported_findings": [],
+            "unsupported_findings": [f.get("id", "") for f in pass1.get("dataset_findings", []) if f.get("id")],
+            "final_narrative": pass1.get("draft_narrative", "Insight unavailable."),
+        }
+
+    system_msg = (
+        "You are an evidence-grounding assistant.\n"
+        "Rules:\n"
+        "1) Do NOT change dataset findings.\n"
+        "2) Only attach sources that clearly support a finding.\n"
+        "3) If unsupported, keep finding as dataset-only.\n"
+        "4) Return valid JSON only."
+    )
+
+    user_msg = f"""
+Chart key: {chart_key}
+
+Dataset findings JSON:
+{json.dumps(pass1, ensure_ascii=True)}
+
+Candidate articles JSON:
+{json.dumps(_shorten_articles(articles), ensure_ascii=True)}
+
+Return exactly this JSON schema:
+{{
+  "supported_findings": [
     {{
-        "Eco_Type": "Ecosystem/Croptype",
-        "Province": "Geolocation",
-        "Yr": "Year",
-        "Sem": "Semester",
-        "level": "Level",
-        "Area": "AreaHarvested",
-        "Prod": "Production",
-        "Yld": "Yield"
+      "finding_id": "F1",
+      "support_summary": "how source supports claim",
+      "source_title": "title",
+      "source_url": "url"
     }}
-    """
+  ],
+  "unsupported_findings": ["F2", "F3"],
+  "final_narrative": "single paragraph of 6-8 sentences, data-first; inline citations [1], [2] only where matched"
+}}
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content
+        parsed = _safe_json_loads(raw, default=None)
+        if parsed and isinstance(parsed, dict):
+            parsed.setdefault("supported_findings", [])
+            parsed.setdefault("unsupported_findings", [])
+            parsed.setdefault("final_narrative", pass1.get("draft_narrative", "Insight unavailable."))
+            if not isinstance(parsed["supported_findings"], list):
+                parsed["supported_findings"] = []
+            if not isinstance(parsed["unsupported_findings"], list):
+                parsed["unsupported_findings"] = []
+            if not isinstance(parsed["final_narrative"], str):
+                parsed["final_narrative"] = str(parsed["final_narrative"])
+            return parsed
+
+        return {
+            "supported_findings": [],
+            "unsupported_findings": [f.get("id", "") for f in pass1.get("dataset_findings", []) if f.get("id")],
+            "final_narrative": (
+                pass1.get("draft_narrative", "Insight unavailable.")
+                + " (Grounding JSON parse failed.)"
+            ),
+        }
+    except Exception as e:
+        return {
+            "supported_findings": [],
+            "unsupported_findings": [f.get("id", "") for f in pass1.get("dataset_findings", []) if f.get("id")],
+            "final_narrative": (
+                pass1.get("draft_narrative", "Insight unavailable.")
+                + f" (Grounding request failed: {e})"
+            ),
+        }
+
+
+# -----------------------------
+# Column mapping helper
+# -----------------------------
+def map_columns(uploaded_columns: list) -> dict:
+    if client is None:
+        return None
+
+    prompt = f"""
+I have a CSV file with these columns:
+{uploaded_columns}
+
+Map them to required columns:
+{REQUIRED_COLUMNS}
+
+Rules:
+- Match by meaning
+- Each required column should be matched once if possible
+- Use null if no good match
+- Return only valid JSON object
+- No markdown, no explanation
+"""
 
     try:
         response = client.chat.completions.create(
@@ -582,78 +505,62 @@ def map_columns(uploaded_columns: list) -> dict:
                     "role": "system",
                     "content": (
                         "You are a data engineering assistant. "
-                        "You only respond with valid JSON. "
-                        "Never include markdown, backticks, "
-                        "or explanations of any kind."
-                    )
+                        "Return only valid JSON."
+                    ),
                 },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+                {"role": "user", "content": prompt},
+            ],
         )
-
-        import json
         raw = response.choices[0].message.content.strip()
-        mapping = json.loads(raw)
-        return mapping
-
-    except Exception as e:
+        parsed = _safe_json_loads(raw, default=None)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
         return None
-    
 
-# ─────────────────────────────────────────────
-# MASTER FUNCTION — GET FULL SECTION
-# Combines AI narrative + institutional sources
-# ─────────────────────────────────────────────
 
-def get_full_section(chart_key, stats, filters={}, fig=None):
-    """
-    Returns a complete report section containing:
-    - Full AI narrative (3-4 paragraphs)
-    - Institutional sources from sources.py
-
-    If fig is provided and detected as empty,
-    returns a not available message instead.
-    """
+# -----------------------------
+# Master section builder
+# -----------------------------
+def get_full_section(chart_key, stats, filters=None, fig=None):
     from sources import SOURCES
     from visualizations import is_chart_empty
 
-    # Check if chart has real data
+    if filters is None:
+        filters = {}
+
     if fig is not None and is_chart_empty(fig):
         return {
             "narrative": (
-                f"This analysis is not available for the current filters. "
-                f"The chart could not be generated because the selected filters "
-                f"— {filters.get('level', 'selected level')}, "
-                f"{', '.join(filters.get('ecosystems', ['selected ecosystems']))}, "
-                f"{filters.get('year_range', 'selected year range')} "
-                f"— do not contain sufficient data for this visualization. "
-                f"Please adjust your filters to include the required data."
+                "This analysis is not available for the current filters. "
+                "The chart could not be generated due to insufficient data."
             ),
-            "institutional": []
+            "institutional": [],
+            "articles": [],
+            "supported_findings": [],
+            "unsupported_findings": [],
         }
 
-    # Map chart keys to insight functions
-    insight_functions = {
-        "yield_trend":       insight_yield_trend,
-        "ecosystem":         insight_ecosystem,
-        "seasonal":          insight_seasonal,
-        "regional":          insight_regional,
-        "area_vs_yield":     insight_area_vs_yield,
-        "top_provinces":     insight_top_provinces,
-        "3d_surface":        insight_3d_surface,
-        "executive_summary": insight_executive_summary,
-    }
+    # 1) Build strict dataset evidence
+    filter_context = build_filter_context(stats, filters)
+    evidence = build_dataset_evidence(chart_key, stats)
 
-    # Get AI narrative
-    narrative = insight_functions[chart_key](stats, filters)
+    # 2) Pass 1 (dataset-only)
+    pass1 = generate_dataset_first_analysis(chart_key, evidence, filter_context)
 
-    # Get institutional sources
+    # 3) Search with dynamic + base queries
+    dyn_queries = build_dynamic_queries(chart_key, pass1)
+    articles = search_real_articles(chart_key, override_queries=dyn_queries)
+
+    # 4) Pass 2 (source grounding)
+    grounded = ground_with_tavily_sources(chart_key, pass1, articles)
+
+    # 5) Institutional references (static trusted orgs)
     institutional = SOURCES.get(chart_key, [])
 
     return {
-        "narrative":     narrative,
-        "institutional": institutional
+        "narrative": grounded.get("final_narrative", pass1.get("draft_narrative", "")),
+        "institutional": institutional,
+        "articles": articles,
+        "supported_findings": grounded.get("supported_findings", []),
+        "unsupported_findings": grounded.get("unsupported_findings", []),
     }
