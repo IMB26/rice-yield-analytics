@@ -8,6 +8,16 @@ from data_processor import REQUIRED_COLUMNS
 
 load_dotenv(override=True)
 
+# Streamlit Cloud stores secrets in st.secrets, not os.environ.
+# Inject them into os.environ so os.getenv() works in both environments.
+try:
+    import streamlit as st
+    for _key in ("GROQ_API_KEY", "TAVILY_API_KEY"):
+        if not os.environ.get(_key) and _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass
+
 # -----------------------------
 # API clients
 # -----------------------------
