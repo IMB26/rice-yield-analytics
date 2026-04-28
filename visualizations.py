@@ -3,6 +3,40 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # ─────────────────────────────────────────────
+# GEOGRAPHIC LEVEL HELPERS
+# ─────────────────────────────────────────────
+_COARSE_LEVELS = ("National", "Region", "Province", "Municipal", "Municipality")
+_FINE_LEVELS   = ("Municipal", "Municipality", "Province", "Region", "National")
+
+_LEVEL_LABEL = {
+    "National":    "National Average",
+    "Region":      "Regional Average",
+    "Province":    "Provincial Average",
+    "Municipal":   "Municipal Average",
+    "Municipality":"Municipal Average",
+}
+_LOCATION_LABEL = {
+    "National":    "National",
+    "Region":      "Region",
+    "Province":    "Province",
+    "Municipal":   "Municipality",
+    "Municipality":"Municipality",
+}
+
+
+def _pick(df, order):
+    available = set(df["level"].unique())
+    for level in order:
+        if level in available:
+            return level
+    return None
+
+
+def _weighted_avg_by_year(group_df):
+    return (group_df["yield"] * group_df["area_harvested"]).sum() / group_df["area_harvested"].sum()
+
+
+# ─────────────────────────────────────────────
 # SHARED CHART THEME
 # ─────────────────────────────────────────────
 _FONT = "Inter, -apple-system, Arial, sans-serif"
@@ -81,49 +115,32 @@ def is_chart_empty(fig):
 def plot_yield_trend(df):
     """
     Line chart showing average rice yield per year.
-    Adapts to available geographic levels in filtered data.
-    Falls back from National → Region → Province automatically.
+    Adapts to whatever geographic level is present in the data
+    (National → Region → Province → Municipal/Municipality).
     """
-    # Smart fallback — use best available level
-    if "National" in df["level"].unique():
-        level_filter = "National"
-        label = "National Average"
-    elif "Region" in df["level"].unique():
-        level_filter = "Region"
-        label = "Regional Average"
-    else:
-        level_filter = "Province"
-        label = "Provincial Average"
+    level_filter = _pick(df, _COARSE_LEVELS)
+    label = _LEVEL_LABEL.get(level_filter, "Average") if level_filter else "Average"
 
-    # Filter to best available level, Palay only
-    # If Palay not available use whatever ecosystem is present
-    if "Palay" in df["ecosystem"].unique():
-        eco_filter = "Palay"
-    else:
-        eco_filter = df["ecosystem"].iloc[0]
+    eco_filter = "Palay" if "Palay" in df["ecosystem"].unique() else df["ecosystem"].iloc[0]
 
     filtered = df[
         (df["level"] == level_filter) &
         (df["ecosystem"] == eco_filter)
-    ]
+    ] if level_filter else df[df["ecosystem"] == eco_filter]
 
-    # Use weighted average when at province level
-
-    if level_filter == "Province":
+    # Weighted average for sub-regional levels (Province/Municipal/Municipality)
+    if level_filter in ("Province", "Municipal", "Municipality"):
         filtered = filtered.groupby("year").apply(
-            lambda x: (x["yield"] * x["area_harvested"]).sum() /
-            x["area_harvested"].sum()
+            _weighted_avg_by_year, include_groups=False
         ).reset_index()
         filtered.columns = ["year", "yield"]
     else:
         filtered = filtered.groupby("year")["yield"].mean().reset_index()
 
     # Final fallback if still empty
-    
     if filtered.empty:
         filtered = df.groupby("year").apply(
-            lambda x: (x["yield"] * x["area_harvested"]).sum() /
-            x["area_harvested"].sum()
+            _weighted_avg_by_year, include_groups=False
         ).reset_index()
         filtered.columns = ["year", "yield"]
         label = "Weighted Average"
@@ -192,13 +209,11 @@ def plot_ecosystem_comparison(df):
         df["ecosystem"].isin(["Irrigated Palay", "Rainfed Palay"])
     ]
 
-    # Smart fallback — use best available level
-    if "Province" in filtered["level"].unique():
-        filtered = filtered[filtered["level"] == "Province"]
-        label = "Province Level"
-    elif "Region" in filtered["level"].unique():
-        filtered = filtered[filtered["level"] == "Region"]
-        label = "Region Level"
+    # Use finest available level for distribution spread
+    fine = _pick(filtered, _FINE_LEVELS)
+    if fine and fine != "National":
+        filtered = filtered[filtered["level"] == fine]
+        label = f"{_LOCATION_LABEL.get(fine, fine)} Level"
     else:
         label = "All Levels"
 
@@ -250,35 +265,28 @@ def plot_seasonal_analysis(df):
     Adapts to available geographic levels.
     Shows message if only one season is available.
     """
-    # Smart fallback — use best available level
-    if "National" in df["level"].unique():
-        level_filter = "National"
-        label = "National"
-    elif "Region" in df["level"].unique():
-        level_filter = "Region"
-        label = "Regional"
-    else:
-        level_filter = "Province"
-        label = "Provincial"
+    level_filter = _pick(df, _COARSE_LEVELS)
+    label = _LOCATION_LABEL.get(level_filter, "").rstrip("y") + ("al" if level_filter not in ("Municipal", "Municipality") else "") if level_filter else ""
+    # Simpler readable label
+    _season_label = {
+        "National": "National", "Region": "Regional",
+        "Province": "Provincial", "Municipal": "Municipal", "Municipality": "Municipal",
+    }
+    label = _season_label.get(level_filter, "Overall")
 
-    # Use Palay if available, otherwise use whatever is present
-    if "Palay" in df["ecosystem"].unique():
-        eco_filter = "Palay"
-    else:
-        eco_filter = df["ecosystem"].iloc[0]
+    eco_filter = "Palay" if "Palay" in df["ecosystem"].unique() else df["ecosystem"].iloc[0]
 
     filtered = df[
         (df["level"] == level_filter) &
         (df["ecosystem"] == eco_filter)
-    ]
+    ] if level_filter else df[df["ecosystem"] == eco_filter]
 
-    # Weighted average at province level
-    if level_filter == "Province":
+    # Weighted average for sub-regional levels
+    if level_filter in ("Province", "Municipal", "Municipality"):
         seasonal = filtered.groupby(
             ["year", "semester"]
         ).apply(
-            lambda x: (x["yield"] * x["area_harvested"]).sum() /
-            x["area_harvested"].sum()
+            _weighted_avg_by_year, include_groups=False
         ).reset_index()
         seasonal.columns = ["year", "semester", "yield"]
     else:
@@ -419,13 +427,11 @@ def plot_area_vs_yield(df):
         df["ecosystem"].isin(["Irrigated Palay", "Rainfed Palay"])
     ]
 
-    # Smart fallback — use best available level
-    if "Province" in filtered["level"].unique():
-        filtered = filtered[filtered["level"] == "Province"]
-        label = "Province Level"
-    elif "Region" in filtered["level"].unique():
-        filtered = filtered[filtered["level"] == "Region"]
-        label = "Region Level"
+    # Use finest available level for meaningful scatter spread
+    fine = _pick(filtered, _FINE_LEVELS)
+    if fine and fine != "National":
+        filtered = filtered[filtered["level"] == fine]
+        label = f"{_LOCATION_LABEL.get(fine, fine)} Level"
     else:
         label = "All Levels"
 
@@ -482,20 +488,22 @@ def plot_area_vs_yield(df):
 
 def plot_top_provinces(df):
     """
-    Horizontal bar chart ranking top 10 and bottom 10
-    provinces by average yield.
-    Requires Province level data to render properly.
-    Uses weighted average by area harvested.
+    Horizontal bar chart ranking top 10 and bottom 10 locations by average yield.
+    Adapts to whatever finest geographic level is present
+    (Municipal/Municipality → Province → Region).
+    National-only data cannot be ranked and shows an informative message.
     """
-    # Check if Province level data exists
-    if "Province" not in df["level"].unique():
+    fine = _pick(df, _FINE_LEVELS)
+    loc_label = _LOCATION_LABEL.get(fine, "Location") if fine else "Location"
+
+    if fine is None or fine == "National":
         fig = go.Figure()
         fig.update_layout(
-            title="Top & Bottom Provinces — Unavailable",
+            title="Top & Bottom Locations — Unavailable",
             annotations=[dict(
                 text=(
-                    "This chart requires Province level data. "
-                    "Please include Province in your filters."
+                    "This chart requires sub-national data "
+                    "(Regional, Provincial, or Municipal level)."
                 ),
                 showarrow=False,
                 font=dict(size=14),
@@ -505,23 +513,19 @@ def plot_top_provinces(df):
         )
         return fig
 
-    # Use Palay if available, otherwise use whatever is present
-    if "Palay" in df["ecosystem"].unique():
-        eco_filter = "Palay"
-    else:
-        eco_filter = df["ecosystem"].iloc[0]
+    eco_filter = "Palay" if "Palay" in df["ecosystem"].unique() else df["ecosystem"].iloc[0]
 
     filtered = df[
-        (df["level"] == "Province") &
+        (df["level"] == fine) &
         (df["ecosystem"] == eco_filter)
     ]
 
     if filtered.empty:
         fig = go.Figure()
         fig.update_layout(
-            title="Top & Bottom Provinces — Insufficient Data",
+            title=f"Top & Bottom {loc_label}s — Insufficient Data",
             annotations=[dict(
-                text="No provincial data available for current filters.",
+                text=f"No {loc_label.lower()} data available for current filters.",
                 showarrow=False,
                 font=dict(size=14),
                 xref="paper", yref="paper",
@@ -530,23 +534,20 @@ def plot_top_provinces(df):
         )
         return fig
 
-    # Weighted average by area harvested per province
-    province_avg = filtered.groupby("location").apply(
+    loc_avg = filtered.groupby("location").apply(
         lambda x: (x["yield"] * x["area_harvested"]).sum() /
         x["area_harvested"].sum()
     ).round(2).reset_index()
-    province_avg.columns = ["location", "yield"]
+    loc_avg.columns = ["location", "yield"]
 
-    # Need at least 10 provinces for top/bottom 10
-    # otherwise just show what's available
-    n = min(10, len(province_avg) // 2)
+    n = min(10, len(loc_avg) // 2)
 
     if n == 0:
         fig = go.Figure()
         fig.update_layout(
-            title="Top & Bottom Provinces — Insufficient Data",
+            title=f"Top & Bottom {loc_label}s — Insufficient Data",
             annotations=[dict(
-                text="Not enough provinces to rank. Please widen your filters.",
+                text=f"Not enough {loc_label.lower()}s to rank. Please widen your filters.",
                 showarrow=False,
                 font=dict(size=14),
                 xref="paper", yref="paper",
@@ -555,16 +556,13 @@ def plot_top_provinces(df):
         )
         return fig
 
-    # Get top and bottom n provinces
-    top_n    = province_avg.nlargest(n, "yield")
-    bottom_n = province_avg.nsmallest(n, "yield")
+    top_n    = loc_avg.nlargest(n, "yield")
+    bottom_n = loc_avg.nsmallest(n, "yield")
 
     top_n["rank"]    = f"Top {n}"
     bottom_n["rank"] = f"Bottom {n}"
 
-    combined = pd.concat([top_n, bottom_n]).sort_values(
-        "yield", ascending=True
-    )
+    combined = pd.concat([top_n, bottom_n]).sort_values("yield", ascending=True)
 
     fig = px.bar(
         combined,
@@ -576,20 +574,19 @@ def plot_top_provinces(df):
             f"Top {n}":    "#2ecc71",
             f"Bottom {n}": "#e74c3c"
         },
-        title=f"Top & Bottom {n} Provinces by Average Yield",
+        title=f"Top & Bottom {n} {loc_label}s by Average Yield",
         labels={
             "yield":    "Average Yield (MT/ha)",
-            "location": "Province",
+            "location": loc_label,
             "rank":     "Ranking"
         },
         text="yield"
     )
 
     fig.update_traces(textposition="outside")
-
     fig.update_layout(
         xaxis_title="Average Yield (MT/ha)",
-        yaxis_title="Province",
+        yaxis_title=loc_label,
         legend_title="Ranking",
         height=600
     )

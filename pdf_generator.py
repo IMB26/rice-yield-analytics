@@ -113,8 +113,9 @@ def add_cover_page(pdf, stats):
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(60, 60, 60)
 
+    loc_label = stats.get("location_label", "Provinces")
     summary_items = [
-        f"Provinces Covered: {stats['provinces']}",
+        f"{loc_label} Covered: {stats['provinces']}",
         f"Regions Covered: {stats['regions']}",
         f"Total Records: {stats['total_records']:,}",
         f"National Average Yield: {stats['national_avg_yield']} MT/ha",

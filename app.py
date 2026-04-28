@@ -184,8 +184,8 @@ st.markdown("""
                 color:rgba(255,255,255,0.85); margin:6px 0 0;
                 font-size:0.97rem; font-weight:400;
             ">
-                Upload a PSA rice production CSV to generate visualizations,
-                AI&nbsp;insights, and a PDF report.
+                Upload a PSA rice production CSV or Excel file to generate visualizations,
+                AI&nbsp;insights, and a downloadable report.
             </p>
         </div>
     </div>
@@ -196,20 +196,26 @@ st.markdown("""
 # FILE UPLOAD
 # ─────────────────────────────────────────────
 uploaded_file = st.file_uploader(
-    "Upload your PSA CSV file",
-    type=["csv"],
-    help="Expected columns: Ecosystem/Croptype, Geolocation, Year, Semester, Level, AreaHarvested, Production, Yield"
+    "Upload your PSA data file",
+    type=["csv", "xlsx", "xls"],
+    help="Accepts CSV or Excel (.xlsx/.xls). Expected columns: Ecosystem/Croptype, Geolocation, Year, Semester, Level, AreaHarvested, Production, Yield"
 )
 
 if uploaded_file is None:
-    st.info("👆 Upload a CSV file to get started.")
+    st.info("👆 Upload a CSV or Excel file to get started.")
     st.stop()
 
 # ─────────────────────────────────────────────
 # LOAD AND CLEAN DATA
 # ─────────────────────────────────────────────
 with st.spinner("Loading and validating data..."):
-    peek = pd.read_csv(uploaded_file, nrows=0)
+    _fname = getattr(uploaded_file, "name", "").lower()
+    _is_excel = _fname.endswith((".xlsx", ".xls"))
+
+    if _is_excel:
+        peek = pd.read_excel(uploaded_file, nrows=0)
+    else:
+        peek = pd.read_csv(uploaded_file, nrows=0)
     uploaded_columns = list(peek.columns)
 
     exact_match = all(col in uploaded_columns for col in REQUIRED_COLUMNS)
@@ -224,7 +230,7 @@ with st.spinner("Loading and validating data..."):
         if mapping is None:
             st.error(
                 "❌ Could not automatically map columns. "
-                "Please use the standard PSA CSV format."
+                "Please use the standard PSA CSV/Excel format."
             )
             st.stop()
 

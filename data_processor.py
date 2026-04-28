@@ -30,19 +30,46 @@ REGION_NAME_MAP = {
     "REGION XIII (CARAGA)":                                   "Region XIII",
 }
 
-# Load and Validate
+# Level hierarchy: coarsest → finest
+_COARSE = ("National", "Region", "Province", "Municipal", "Municipality")
+_FINE   = ("Municipal", "Municipality", "Province", "Region", "National")
+
+# Human-readable plural labels per level
+_LOCATION_PLURAL = {
+    "National":    "National Entries",
+    "Region":      "Regions",
+    "Province":    "Provinces",
+    "Municipal":   "Municipalities",
+    "Municipality": "Municipalities",
+}
+
+
+def _pick_level(available: set, order: tuple):
+    for level in order:
+        if level in available:
+            return level
+    return next(iter(available), None)
+
+
+# ─────────────────────────────────────────────
+# 1. LOAD AND VALIDATE
+# ─────────────────────────────────────────────
+
 def load_and_validate(file, column_mapping=None):
     """
-    Reads CSV and checks all required columns exist.
+    Reads CSV or Excel (.xlsx/.xls) and checks all required columns exist.
     If column_mapping is provided, renames columns first.
     Returns the raw DataFrame if valid.
     """
     try:
-        df = pd.read_csv(file, na_values=["..","#DIV/0!"])
+        name = getattr(file, "name", "")
+        if name.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(file, na_values=["..", "#DIV/0!"])
+        else:
+            df = pd.read_csv(file, na_values=["..", "#DIV/0!"])
     except Exception as e:
         return None, False, f"Could not read file: {e}"
 
-    # Apply column mapping if provided
     if column_mapping:
         rename_map = {
             uploaded: required
@@ -51,25 +78,22 @@ def load_and_validate(file, column_mapping=None):
         }
         df = df.rename(columns=rename_map)
 
-    # Check for missing columns
     missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing:
         return None, False, f"Missing columns: {missing}"
 
-    # Check file isn't empty
     if df.empty:
         return None, False, "File is empty."
 
     return df, True, "File loaded successfully."
 
+
 # ─────────────────────────────────────────────
 # 2. CLEAN DATA
 # ─────────────────────────────────────────────
 
-SEMESTER_MAP = {
-    1: "Wet Season",
-    2: "Dry Season"
-}
+SEMESTER_MAP = {1: "Wet Season", 2: "Dry Season"}
+
 
 def clean_data(df):
     """
@@ -80,7 +104,6 @@ def clean_data(df):
     - Drops duplicates and nulls
     - Ensures correct data types
     """
-    # Rename columns to clean snake_case
     df = df.rename(columns={
         "Ecosystem/Croptype": "ecosystem",
         "Geolocation":        "location",
@@ -92,82 +115,78 @@ def clean_data(df):
         "Yield":              "yield"
     })
 
-    # Strip whitespace from text columns
     df["ecosystem"] = df["ecosystem"].str.strip()
     df["location"]  = df["location"].str.strip()
     df["level"]     = df["level"].str.strip()
 
-    # Clean up region names
     df["location"] = df["location"].replace(REGION_NAME_MAP)
-
-    # Map semester numbers to readable labels
     df["semester"] = df["semester"].map(SEMESTER_MAP)
 
-    # Drop duplicates
     df = df.drop_duplicates()
-
-    # Drop rows where key numeric columns are null
     df = df.dropna(subset=["yield", "production", "area_harvested"])
     df = df.reset_index(drop=True)
 
-    # Ensure correct data types
-    df["year"]          = df["year"].astype(int)
+    df["year"]           = df["year"].astype(int)
     df["area_harvested"] = df["area_harvested"].astype(float)
-    df["production"]    = df["production"].astype(float)
-    df["yield"]         = df["yield"].astype(float)
+    df["production"]     = df["production"].astype(float)
+    df["yield"]          = df["yield"].astype(float)
 
     return df
+
+
 # ─────────────────────────────────────────────
 # 3. SUMMARY STATS
 # ─────────────────────────────────────────────
 
+def _weighted_avg(group):
+    return (group["yield"] * group["area_harvested"]).sum() / group["area_harvested"].sum()
+
+
 def get_summary_stats(df):
     """
     Extracts key statistics from the cleaned DataFrame.
-    Adapts to whatever data is available after filtering.
+    Adapts to whatever geographic level is available in the data.
     """
-    # Best available level for national stats
-    if "National" in df["level"].unique():
-        level_filter = "National"
-    elif "Region" in df["level"].unique():
-        level_filter = "Region"
-    else:
-        level_filter = "Province"
+    available = set(df["level"].unique())
 
-    # Best available ecosystem for overall stats
-    if "Palay" in df["ecosystem"].unique():
-        eco_filter = "Palay"
-    else:
-        eco_filter = df["ecosystem"].iloc[0]
+    # Coarsest level for overall/national averages
+    level_filter = _pick_level(available, _COARSE)
 
-    # National/overall stats
+    # Finest level for location rankings
+    fine_level = _pick_level(available, _FINE)
+
+    # Best available ecosystem
+    eco_filter = "Palay" if "Palay" in df["ecosystem"].unique() else df["ecosystem"].iloc[0]
+
+    # Overall yield trend at the coarsest level
     national = df[
         (df["level"] == level_filter) &
         (df["ecosystem"] == eco_filter)
     ]
 
-    # Weighted average at province level
-    if level_filter == "Province":
+    if level_filter in ("Province", "Municipal", "Municipality"):
         national_avg = national.groupby("year").apply(
-            lambda x: (x["yield"] * x["area_harvested"]).sum() /
-            x["area_harvested"].sum()
+            _weighted_avg, include_groups=False
         ).reset_index()
         national_avg.columns = ["year", "yield"]
     else:
         national_avg = national.groupby("year")["yield"].mean().reset_index()
 
-    # Top and bottom provinces
-    if "Province" in df["level"].unique():
-        provincial = df[
-            (df["level"] == "Province") &
+    # Top / bottom locations at finest granularity
+    if fine_level and fine_level != "National":
+        loc_data = df[
+            (df["level"] == fine_level) &
             (df["ecosystem"] == eco_filter)
         ]
-        province_avg = provincial.groupby("location").apply(
-            lambda x: (x["yield"] * x["area_harvested"]).sum() /
-            x["area_harvested"].sum()
-        ).round(2)
-        top_5    = province_avg.nlargest(5).to_dict()
-        bottom_5 = province_avg.nsmallest(5).to_dict()
+        if not loc_data.empty:
+            location_avg = loc_data.groupby("location").apply(
+                _weighted_avg, include_groups=False
+            ).round(2)
+            top_5    = location_avg.nlargest(5).to_dict()
+            bottom_5 = location_avg.nsmallest(5).to_dict()
+        else:
+            top_5 = {}
+            bottom_5 = {}
     else:
         top_5    = {}
         bottom_5 = {}
@@ -200,7 +219,7 @@ def get_summary_stats(df):
         dry["area_harvested"].sum(), 2
     ) if not dry.empty else "N/A"
 
-    # Safe best/worst year extraction
+    # Best / worst year
     if not national_avg.empty:
         best_year  = int(national_avg.loc[national_avg["yield"].idxmax(), "year"])
         worst_year = int(national_avg.loc[national_avg["yield"].idxmin(), "year"])
@@ -214,12 +233,19 @@ def get_summary_stats(df):
         max_yield  = "N/A"
         min_yield  = "N/A"
 
-    stats = {
+    # Count of finest-level locations
+    if fine_level:
+        location_count = df[df["level"] == fine_level]["location"].nunique()
+    else:
+        location_count = 0
+
+    return {
         # General
-        "year_range":    f"{df['year'].min()} - {df['year'].max()}",
-        "total_records": len(df),
-        "provinces":     df[df["level"] == "Province"]["location"].nunique(),
-        "regions":       df[df["level"] == "Region"]["location"].nunique(),
+        "year_range":      f"{df['year'].min()} - {df['year'].max()}",
+        "total_records":   len(df),
+        "provinces":       location_count,
+        "location_label":  _LOCATION_PLURAL.get(fine_level, "Locations"),
+        "regions":         df[df["level"] == "Region"]["location"].nunique(),
 
         # Yield stats
         "national_avg_yield": avg_yield,
@@ -236,9 +262,7 @@ def get_summary_stats(df):
         "wet_season_avg": wet_avg,
         "dry_season_avg": dry_avg,
 
-        # Provincial
+        # Location rankings
         "top_5_provinces":    top_5,
         "bottom_5_provinces": bottom_5,
     }
-
-    return stats

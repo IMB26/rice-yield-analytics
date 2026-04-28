@@ -159,8 +159,9 @@ def _cover_page_xml(stats: dict) -> str:
     parts.append(_center(f"Generated: {datetime.today().strftime('%B %d, %Y')}"))
     parts.append(_empty_para())
 
+    loc_label = stats.get("location_label", "Provinces")
     rows = [
-        ("Provinces Covered",      str(stats["provinces"])),
+        (f"{loc_label} Covered",   str(stats["provinces"])),
         ("Regions Covered",        str(stats["regions"])),
         ("Total Records",          f"{stats['total_records']:,}"),
         ("National Average Yield", f"{stats['national_avg_yield']} MT/ha"),
